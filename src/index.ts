@@ -12,10 +12,11 @@ import {
 } from '@deepseek-ai/dsh-agent'
 import { createUserMessage, ReasoningEffortId, type ContentBlock } from '@deepseek-ai/dsh-llm'
 import * as McpClient from '@deepseek-ai/dsh-mcp-client'
-import { SessionId, type SessionEvent, type TurnEndReason } from '@deepseek-ai/dsh-session'
+import { SessionId, SessionLogOffset, buildForkSeed, type SessionEvent, type SessionSeq, type TurnEndReason } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/cordis-plugin-loader'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
 import type {} from '@deepseek-ai/dsh-cmdline'
+import type {} from '@deepseek-ai/dsh-session-query'
 import type {} from '@deepseek-ai/dsh-subprocess'
 import type {} from '@deepseek-ai/dsh-user-approval'
 import type { ApprovalOutcome } from '@deepseek-ai/dsh-user-approval'
@@ -387,6 +388,24 @@ function resultFromReason(active: ActiveRun): Omit<Extract<OutboundFrame, { type
   }
 }
 
+/**
+ * Default fork boundary: the latest completed-turn prefix, including
+ * standalone events before the next turn begins. Mirrors the web host's
+ * `latestCompletedPrefixBoundary` (dsh session-controller commands.ts) so the
+ * bridge forks at the same cut.
+ */
+function latestCompletedPrefixBoundary(events: readonly SessionEvent[]): SessionSeq | undefined {
+  const lastTurnEnd = events.findLast(event => event.type === 'turn/end')
+  if (lastTurnEnd === undefined) return undefined
+  let boundary = lastTurnEnd.seq
+  for (const next of events.slice(boundary + 1)) {
+    if (next.type === 'turn/start' || (next.type === 'user/message' && next.surfaceOp === 'append')
+      || next.type === 'agent/inbox/spliced') break
+    boundary = next.seq
+  }
+  return boundary
+}
+
 async function createOrResumeAgent(
   ctx: Context,
   active: ActiveRun,
@@ -437,6 +456,35 @@ async function createOrResumeAgent(
     }
   }
   const options = { provider: selection.provider, model: selection.model }
+  if (active.command.fork_parent !== undefined) {
+    // M-133 check 4 prototype: mirror the web host's fork (session-controller
+    // commands.ts) from the headless bridge — observe the parent, seed the
+    // child with the completed prefix, link it via meta.parentSession.
+    const sessionQuery = ctx.get('sessionQuery')
+    if (sessionQuery === undefined) throw new Error('fork: the sessionQuery service is unavailable in this composition')
+    const observed = await sessionQuery.observeSession(SessionId(active.command.fork_parent))
+    try {
+      const boundary = latestCompletedPrefixBoundary(observed.events)
+      if (boundary === undefined) {
+        throw new Error(`fork: session ${active.command.fork_parent} has no completed turn to seed from`)
+      }
+      const handle = await agents.create({
+        sessionId: SessionId(`multica-${randomUUID()}`),
+        seed: buildForkSeed(observed.events, boundary),
+        inheritedEventCount: SessionLogOffset(boundary + 1),
+        meta: {
+          cwd: active.command.cwd,
+          parentSession: observed.header.id,
+          isSeeded: true,
+        },
+        agentOptions: options,
+        setup,
+      })
+      return { handle, resumed: false }
+    } finally {
+      observed[Symbol.dispose]()
+    }
+  }
   if (active.command.resume_session_id === undefined) {
     const handle = await agents.create({
       sessionId: SessionId(`multica-${randomUUID()}`),
@@ -580,6 +628,23 @@ async function stdio(ctx: Context): Promise<number> {
       }
       const active = activeRef.current
       if (active === undefined || command.request_id !== active.command.request_id || activeRef.finished) return
+      if (command.type === 'steer' || command.type === 'queue') {
+        // M-133 check 3 prototype: dsh's agent inbox already owns the
+        // semantics — steer is consumed at the next step boundary, followup
+        // becomes the next turn. No second writer: both land in THIS process.
+        const agent = active.agent
+        if (agent === undefined) {
+          writeDiagnostic(`dropping ${command.type}: the agent session is not up yet`)
+          return
+        }
+        const message = createUserMessage({
+          content: [{ type: 'text', text: command.message }],
+          source: { kind: 'user' },
+        })
+        if (command.type === 'steer') agent.steer(message)
+        else agent.followup(message)
+        return
+      }
       if (command.type === 'answer') {
         if (!settlePendingQuestion(active.pendingQuestion, command)) {
           writeDiagnostic(`ignoring answer for unknown or settled question ${command.call_id}`)
@@ -624,6 +689,9 @@ async function stdio(ctx: Context): Promise<number> {
       usage: true,
       tools: true,
       questions: true,
+      steer: true,
+      queue: true,
+      fork: true,
       mcp: ['stdio', 'streamable-http'],
     },
   })

@@ -38,6 +38,12 @@ export interface ExecuteCommand {
   cwd: string
   prompt: string
   resume_session_id?: string
+  /**
+   * M-133 check 4 prototype: seed a fresh child session from this parent's
+   * latest completed turn, carrying `meta.parentSession` + `isSeeded`.
+   * Mutually exclusive with `resume_session_id`.
+   */
+  fork_parent?: string
   model?: ModelSelectionInput
   reasoning_effort?: string
   mcp_servers: McpServerInput[]
@@ -49,7 +55,27 @@ export interface CancelCommand {
   request_id: string
 }
 
-export type InboundCommand = ExecuteCommand | CancelCommand | AnswerCommand
+/**
+ * M-133 check 3 prototype: deliver a human message to the agent's runtime
+ * inbox at the next step boundary (`steer`) or as the next turn (`queue`).
+ * Both are additive at protocol v1; the daemon sends them only after the
+ * ready frame advertised `steer`/`queue`.
+ */
+export interface SteerCommand {
+  v: typeof PROTOCOL_VERSION
+  type: 'steer'
+  request_id: string
+  message: string
+}
+
+export interface QueueCommand {
+  v: typeof PROTOCOL_VERSION
+  type: 'queue'
+  request_id: string
+  message: string
+}
+
+export type InboundCommand = ExecuteCommand | CancelCommand | AnswerCommand | SteerCommand | QueueCommand
 
 export interface RuntimeModelFrame {
   id: string
@@ -119,14 +145,17 @@ export type OutboundFrame =
     runtime: 'dsh'
     plugin_version: string
     capabilities: {
-      resume: true
-      cancel: true
-      models: true
-      thinking: true
-      usage: true
-      tools: true
-      questions: true
-      mcp: ['stdio', 'streamable-http']
+      resume: true,
+      cancel: true,
+      models: true,
+      thinking: true,
+      usage: true,
+      tools: true,
+      questions: true,
+      steer: true,
+      queue: true,
+      fork: true,
+      mcp: ['stdio', 'streamable-http'],
     }
   }
   | { v: typeof PROTOCOL_VERSION; type: 'probe'; runtime: 'dsh'; plugin_version: string; protocol_version: number }
@@ -321,10 +350,19 @@ export function parseInboundCommand(line: string): InboundCommand {
       answers,
     }
   }
+  if (type === 'steer' || type === 'queue') {
+    assertOnlyKeys(command, ['v', 'type', 'request_id', 'message'], `${type} command`)
+    return {
+      v: PROTOCOL_VERSION,
+      type,
+      request_id: requiredString(command.request_id, `${type}.request_id`),
+      message: requiredString(command.message, `${type}.message`),
+    }
+  }
   if (type === 'execute') {
     assertOnlyKeys(
       command,
-      ['v', 'type', 'request_id', 'cwd', 'prompt', 'resume_session_id', 'model', 'reasoning_effort', 'mcp_servers'],
+      ['v', 'type', 'request_id', 'cwd', 'prompt', 'resume_session_id', 'fork_parent', 'model', 'reasoning_effort', 'mcp_servers'],
       'execute command',
     )
     return {
@@ -336,6 +374,9 @@ export function parseInboundCommand(line: string): InboundCommand {
       ...optionalString(command.resume_session_id, 'execute.resume_session_id') === undefined
         ? {}
         : { resume_session_id: optionalString(command.resume_session_id, 'execute.resume_session_id') },
+      ...optionalString(command.fork_parent, 'execute.fork_parent') === undefined
+        ? {}
+        : { fork_parent: optionalString(command.fork_parent, 'execute.fork_parent') },
       ...parseModel(command.model) === undefined ? {} : { model: parseModel(command.model) },
       ...optionalString(command.reasoning_effort, 'execute.reasoning_effort') === undefined
         ? {}
