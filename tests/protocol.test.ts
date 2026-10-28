@@ -139,6 +139,55 @@ describe('parseInboundCommand', () => {
       answers: [{ id: 'plan', selected: 'Approve' }],
     }))).toThrow('array of strings')
   })
+
+  it('parses steer and queue commands with a required message', () => {
+    expect(parseInboundCommand(JSON.stringify({
+      v: 1,
+      type: 'steer',
+      request_id: 'request-1',
+      message: 'use the staged branch',
+    }))).toEqual({
+      v: PROTOCOL_VERSION,
+      type: 'steer',
+      request_id: 'request-1',
+      message: 'use the staged branch',
+    })
+
+    expect(parseInboundCommand(JSON.stringify({
+      v: 1,
+      type: 'queue',
+      request_id: 'request-1',
+      message: 'then run pnpm check',
+    }))).toEqual({
+      v: PROTOCOL_VERSION,
+      type: 'queue',
+      request_id: 'request-1',
+      message: 'then run pnpm check',
+    })
+  })
+
+  it('rejects malformed steer and queue commands', () => {
+    expect(() => parseInboundCommand(JSON.stringify({
+      v: 1,
+      type: 'steer',
+      request_id: 'request-1',
+    }))).toThrow('steer.message must be a non-empty string')
+
+    expect(() => parseInboundCommand(JSON.stringify({
+      v: 1,
+      type: 'queue',
+      request_id: 'request-1',
+      message: 42,
+    }))).toThrow('queue.message must be a non-empty string')
+
+    expect(() => parseInboundCommand(JSON.stringify({
+      v: 1,
+      type: 'steer',
+      request_id: 'request-1',
+      message: 'hi',
+      extra: true,
+    }))).toThrow('steer command contains unsupported field: extra')
+  })
 })
 
 describe('wire helpers', () => {

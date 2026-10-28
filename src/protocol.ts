@@ -49,7 +49,30 @@ export interface CancelCommand {
   request_id: string
 }
 
-export type InboundCommand = ExecuteCommand | CancelCommand | AnswerCommand
+/**
+ * Deliver a human message to the agent's runtime inbox at the next step
+ * boundary (`steer`) or as the next turn (`queue`). Both are additive at
+ * protocol v1; the daemon sends them only after the `ready` frame advertised
+ * `steer`/`queue`, and reads the run's state back on the `inbox_state` frame.
+ */
+export interface SteerCommand {
+  v: typeof PROTOCOL_VERSION
+  type: 'steer'
+  request_id: string
+  message: string
+}
+
+export interface QueueCommand {
+  v: typeof PROTOCOL_VERSION
+  type: 'queue'
+  request_id: string
+  message: string
+}
+
+export type InboundCommand = ExecuteCommand | CancelCommand | AnswerCommand | SteerCommand | QueueCommand
+
+/** Every command that may follow `execute` on a run's stdio stream. */
+export type PostExecuteCommand = Exclude<InboundCommand, ExecuteCommand>
 
 export interface RuntimeModelFrame {
   id: string
@@ -119,14 +142,16 @@ export type OutboundFrame =
     runtime: 'dsh'
     plugin_version: string
     capabilities: {
-      resume: true
-      cancel: true
-      models: true
-      thinking: true
-      usage: true
-      tools: true
-      questions: true
-      mcp: ['stdio', 'streamable-http']
+      resume: true,
+      cancel: true,
+      models: true,
+      thinking: true,
+      usage: true,
+      tools: true,
+      questions: true,
+      steer: true,
+      queue: true,
+      mcp: ['stdio', 'streamable-http'],
     }
   }
   | { v: typeof PROTOCOL_VERSION; type: 'probe'; runtime: 'dsh'; plugin_version: string; protocol_version: number }
@@ -169,7 +194,18 @@ export type OutboundFrame =
     resume_rejected: boolean
     error?: { code: string; message: string }
   }
+  /**
+   * Accepted/applied/rejected state of one inbound `steer` or `queue`, so the
+   * daemon and UI can show whether the message reached the agent's inbox.
+   * `reason` is carried on `rejected` only: `agent_not_ready`,
+   * `run_finished`, `unknown_request_id`, or the delivery error text.
+   */
+  | { v: typeof PROTOCOL_VERSION; type: 'inbox_state'; request_id: string; command: 'steer' | 'queue'; state: 'accepted' | 'applied' }
+  | { v: typeof PROTOCOL_VERSION; type: 'inbox_state'; request_id: string; command: 'steer' | 'queue'; state: 'rejected'; reason: string }
   | { v: typeof PROTOCOL_VERSION; type: 'protocol_error'; code: string; message: string }
+
+/** One `inbox_state` frame in any of its three states. */
+export type InboxStateFrame = Extract<OutboundFrame, { type: 'inbox_state' }>
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -319,6 +355,15 @@ export function parseInboundCommand(line: string): InboundCommand {
       request_id: requiredString(command.request_id, 'answer.request_id'),
       call_id: requiredString(command.call_id, 'answer.call_id'),
       answers,
+    }
+  }
+  if (type === 'steer' || type === 'queue') {
+    assertOnlyKeys(command, ['v', 'type', 'request_id', 'message'], `${type} command`)
+    return {
+      v: PROTOCOL_VERSION,
+      type,
+      request_id: requiredString(command.request_id, `${type}.request_id`),
+      message: requiredString(command.message, `${type}.message`),
     }
   }
   if (type === 'execute') {
