@@ -64,6 +64,13 @@ The runtime contract includes:
   resolve with the daemon's inbound `answer` command carrying the human's
   reply; an answer for an unknown or settled question is ignored with a stderr
   diagnostic, and cancel aborts the wait;
+- steer and queue: inbound `steer` reaches the agent's inbox at its next step
+  boundary and inbound `queue` becomes the run's next turn, advertised as
+  `capabilities.steer`/`capabilities.queue`; each delivery is confirmed on the
+  outbound `inbox_state` frame — `accepted`, then `applied` at that boundary,
+  or `rejected` with a reason — a command naming another request or a finished
+  run never reaches the agent (which keeps `cancel` per session), and a
+  malformed line is reported as `protocol_error` without ending the run;
 - narrowly forwards only Multica's server-minted `mat_` task token into DSH's
   otherwise credential-scrubbed shell, so in-task `multica` commands retain
   task attribution without exposing model-provider credentials.

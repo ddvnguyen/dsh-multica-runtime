@@ -10,7 +10,7 @@ import {
   type ModelSelection,
   type ModelSelectionRef,
 } from '@deepseek-ai/dsh-agent'
-import { createUserMessage, ReasoningEffortId, type ContentBlock } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, ReasoningEffortId, type ContentBlock, type UserMessage } from '@deepseek-ai/dsh-llm'
 import * as McpClient from '@deepseek-ai/dsh-mcp-client'
 import { SessionId, type SessionEvent, type TurnEndReason } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/cordis-plugin-loader'
@@ -28,12 +28,16 @@ import {
   truncateUtf8,
   type AnswerCommand,
   type ExecuteCommand,
+  type InboxStateFrame,
   type McpServerInput,
   type OutboundFrame,
+  type PostExecuteCommand,
+  type QueueCommand,
   type RuntimeAnswerItem,
   type RuntimeModelFrame,
   type RuntimeQuestion,
   type RuntimeQuestionIntent,
+  type SteerCommand,
 } from './protocol.js'
 import { installMulticaTerminalEnvironment } from './environment.js'
 import { settleCancelled as settleCancelledAgent, waitForQuiescence, type SubagentLifecycle } from './lifecycle.js'
@@ -59,6 +63,8 @@ interface ActiveRun {
    * settles it from the daemon's `answer` command, and cancel rejects it.
    */
   pendingQuestion?: { callId: string; resolve: (answers: RuntimeAnswerItem[]) => void; reject: (error: Error) => void }
+  /** Deliveries waiting for their boundary event, so accepted/applied frames pair up. */
+  inbox: InboxTracker
 }
 
 class ResumeRejectedError extends Error {
@@ -115,6 +121,123 @@ export function settlePendingQuestion(
   if (pending === undefined || pending.callId !== command.call_id) return false
   pending.resolve(command.answers)
   return true
+}
+
+/** The agent surface an inbound `steer`/`queue` needs to reach the inbox. */
+export interface InboxAgent {
+  readonly session: { readonly seq: number }
+  steer(message: UserMessage): void
+  followup(message: UserMessage): void
+}
+
+/** One delivered message waiting for the boundary event that applies it. */
+export interface PendingInboxEntry {
+  command: 'steer' | 'queue'
+  message: UserMessage
+  /** Agent seq at delivery: a boundary at or below it is not this message's. */
+  acceptedSeq: number
+}
+
+/** A run's inbox deliveries, tracked so the accepted/applied frames pair up. */
+export interface InboxTracker {
+  pending: PendingInboxEntry[]
+  /**
+   * Seq of the first observed `turn/start` — the run's initial prompt turn.
+   * A queue accepted before it waits for the following turn: a queued message
+   * becomes the sole message of its own turn, never the prompt's.
+   */
+  promptTurnSeq?: number
+}
+
+/** The slice of a run one post-execute command is checked against. */
+export interface RunRef {
+  requestId: string
+  finished: boolean
+  agent?: InboxAgent
+  inbox: InboxTracker
+}
+
+/**
+ * What one command that followed `execute` may do:
+ * `deliver`/`reject` answer a `steer`/`queue` with its `inbox_state` frame,
+ * `act` lets an `answer`/`cancel` that names this run proceed, and `drop`
+ * keeps a foreign or stale command away from the agent.
+ */
+export type InboundOutcome =
+  | { kind: 'deliver'; frame: InboxStateFrame }
+  | { kind: 'reject'; frame: InboxStateFrame }
+  | { kind: 'act' }
+  | { kind: 'drop' }
+
+function rejectedInboxFrame(command: SteerCommand | QueueCommand, reason: string): InboundOutcome {
+  return {
+    kind: 'reject',
+    frame: { v: PROTOCOL_VERSION, type: 'inbox_state', request_id: command.request_id, command: command.type, state: 'rejected', reason },
+  }
+}
+
+/**
+ * Route one command that followed `execute` against the run it addresses.
+ *
+ * A `steer`/`queue` is delivered only when it names this run, the run is
+ * alive and its agent exists; the delivered message is pushed onto the run's
+ * tracker *before* the agent call so a boundary event observed during the
+ * call cannot go unpaired. `drop` is the per-session cancel gate: one DSH
+ * process handles exactly one `execute` and one session, so a cancel naming
+ * any other request never reaches the agent.
+ */
+export function dispatchInbound(run: RunRef | undefined, command: PostExecuteCommand): InboundOutcome {
+  if (command.type === 'steer' || command.type === 'queue') {
+    if (run === undefined) return rejectedInboxFrame(command, 'agent_not_ready')
+    if (command.request_id !== run.requestId) return rejectedInboxFrame(command, 'unknown_request_id')
+    if (run.finished) return rejectedInboxFrame(command, 'run_finished')
+    if (run.agent === undefined) return rejectedInboxFrame(command, 'agent_not_ready')
+    const message = createUserMessage({ content: [{ type: 'text', text: command.message }], source: { kind: 'user' } })
+    const pending: PendingInboxEntry = { command: command.type, message, acceptedSeq: run.agent.session.seq }
+    run.inbox.pending.push(pending)
+    try {
+      if (command.type === 'steer') run.agent.steer(message)
+      else run.agent.followup(message)
+    } catch (error: unknown) {
+      run.inbox.pending = run.inbox.pending.filter(entry => entry !== pending)
+      return rejectedInboxFrame(command, errorMessage(error))
+    }
+    return {
+      kind: 'deliver',
+      frame: { v: PROTOCOL_VERSION, type: 'inbox_state', request_id: command.request_id, command: command.type, state: 'accepted' },
+    }
+  }
+  if (run === undefined || command.request_id !== run.requestId || run.finished) return { kind: 'drop' }
+  return { kind: 'act' }
+}
+
+function drainApplied(tracker: InboxTracker, requestId: string, command: 'steer' | 'queue', seq: number): InboxStateFrame[] {
+  const applied: InboxStateFrame[] = []
+  tracker.pending = tracker.pending.filter((entry) => {
+    if (entry.command !== command || entry.acceptedSeq >= seq) return true
+    applied.push({ v: PROTOCOL_VERSION, type: 'inbox_state', request_id: requestId, command, state: 'applied' })
+    return false
+  })
+  return applied
+}
+
+/**
+ * The `applied` frames for one run-boundary session event: a `step/start`
+ * applies every steer delivered before it (dsh consumes steering at its next
+ * step boundary), a `turn/start` applies queued followups — except the run's
+ * first observed turn, which belongs to the initial prompt. Any other event
+ * applies nothing.
+ */
+export function inboxBoundaryFrames(tracker: InboxTracker, requestId: string, type: string, seq: number): InboxStateFrame[] {
+  if (type === 'turn/start') {
+    if (tracker.promptTurnSeq === undefined) {
+      tracker.promptTurnSeq = seq
+      return []
+    }
+    return drainApplied(tracker, requestId, 'queue', seq)
+  }
+  if (type === 'step/start') return drainApplied(tracker, requestId, 'steer', seq)
+  return []
 }
 
 function errorMessage(error: unknown): string {
@@ -272,6 +395,9 @@ function renderBlock(block: ContentBlock): string {
 function observeSessionEvent(active: ActiveRun, session: Agent['session'], event: SessionEvent): void {
   if (active.agent?.session !== session || event.seq < active.firstSeq) return
   const requestId = active.command.request_id
+  if (event.type === 'step/start' || event.type === 'turn/start') {
+    for (const frame of inboxBoundaryFrames(active.inbox, requestId, event.type, event.seq)) writeFrame(frame)
+  }
   if (event.type === 'assistant/message') {
     const text = event.data.message.content
       .filter(block => block.type === 'text')
@@ -570,6 +696,7 @@ async function stdio(ctx: Context): Promise<number> {
           cancel: new AbortController(),
           lastText: '',
           toolNames: new Map(),
+          inbox: { pending: [] },
         }
         activeRef.current = active
         const resolveCommand = resolveExecute
@@ -579,7 +706,19 @@ async function stdio(ctx: Context): Promise<number> {
         return
       }
       const active = activeRef.current
-      if (active === undefined || command.request_id !== active.command.request_id || activeRef.finished) return
+      const outcome = dispatchInbound(
+        active === undefined
+          ? undefined
+          : { requestId: active.command.request_id, finished: activeRef.finished, agent: active.agent, inbox: active.inbox },
+        command,
+      )
+      if (outcome.kind === 'deliver' || outcome.kind === 'reject') {
+        writeFrame(outcome.frame)
+        return
+      }
+      if (outcome.kind === 'drop') return
+      // `act` means the command names this run while it lives: answer or cancel.
+      if (active === undefined) return // unreachable: a missing run is answered with `drop`/`reject`
       if (command.type === 'answer') {
         if (!settlePendingQuestion(active.pendingQuestion, command)) {
           writeDiagnostic(`ignoring answer for unknown or settled question ${command.call_id}`)
@@ -592,16 +731,15 @@ async function stdio(ctx: Context): Promise<number> {
       active.cancel.abort()
       active.agent?.cancel({ kind: 'user' })
     } catch (error: unknown) {
+      // A malformed line must not end a running task (M-134): report it and
+      // keep the run — only an explicit `cancel` does that. Before `execute`
+      // resolves, a bad line still fails startup.
       protocolError('INVALID_COMMAND', errorMessage(error))
       const active = activeRef.current
       if (active === undefined && rejectExecute !== undefined) {
         rejectExecute(new Error(errorMessage(error)))
         resolveExecute = undefined
         rejectExecute = undefined
-      } else if (active !== undefined) {
-        active.cancelRequested = true
-        active.cancel.abort()
-        active.agent?.cancel({ kind: 'user' })
       }
     }
   })
@@ -624,6 +762,8 @@ async function stdio(ctx: Context): Promise<number> {
       usage: true,
       tools: true,
       questions: true,
+      steer: true,
+      queue: true,
       mcp: ['stdio', 'streamable-http'],
     },
   })
