@@ -69,10 +69,29 @@ export interface QueueCommand {
   message: string
 }
 
-export type InboundCommand = ExecuteCommand | CancelCommand | AnswerCommand | SteerCommand | QueueCommand
+/**
+ * Compact one idle session with dsh's own compaction seam and return the
+ * summary (S3-B1 / M-137). It is a FIRST command — an alternative to
+ * `execute` on a fresh stdio process — because the session's run has already
+ * ended and its process with it; the daemon's per-session cache clock sends it
+ * only when it fires at TTL−margin. Additive at protocol v1: a bridge that
+ * predates it never advertises the `summarize` capability, and the daemon
+ * never sends the command without that advertisement.
+ */
+export interface SummarizeCommand {
+  v: typeof PROTOCOL_VERSION
+  type: 'summarize'
+  request_id: string
+  session_id: string
+  model?: ModelSelectionInput
+}
+
+export type FirstCommand = ExecuteCommand | SummarizeCommand
+
+export type InboundCommand = ExecuteCommand | SummarizeCommand | CancelCommand | AnswerCommand | SteerCommand | QueueCommand
 
 /** Every command that may follow `execute` on a run's stdio stream. */
-export type PostExecuteCommand = Exclude<InboundCommand, ExecuteCommand>
+export type PostExecuteCommand = Exclude<InboundCommand, FirstCommand>
 
 export interface RuntimeModelFrame {
   id: string
@@ -151,12 +170,20 @@ export type OutboundFrame =
       questions: true,
       steer: true,
       queue: true,
+      summarize: true,
       mcp: ['stdio', 'streamable-http'],
     }
   }
   | { v: typeof PROTOCOL_VERSION; type: 'probe'; runtime: 'dsh'; plugin_version: string; protocol_version: number }
   | { v: typeof PROTOCOL_VERSION; type: 'models'; models: RuntimeModelFrame[] }
   | { v: typeof PROTOCOL_VERSION; type: 'session'; request_id: string; session_id: string; resumed: boolean }
+  /**
+   * The summary dsh's compaction produced for a `summarize` command. The
+   * daemon stores it beside the session (S3-B1); `summary_tokens` is the
+   * bridge's bytes/4 estimate, good enough for the size record the decision
+   * log keeps.
+   */
+  | { v: typeof PROTOCOL_VERSION; type: 'summary'; request_id: string; session_id: string; summary: string; summary_tokens: number }
   | { v: typeof PROTOCOL_VERSION; type: 'text'; request_id: string; content: string }
   | { v: typeof PROTOCOL_VERSION; type: 'thinking'; request_id: string; content: string }
   | { v: typeof PROTOCOL_VERSION; type: 'tool_call'; request_id: string; call_id: string; name: string; arguments: string }
@@ -364,6 +391,16 @@ export function parseInboundCommand(line: string): InboundCommand {
       type,
       request_id: requiredString(command.request_id, `${type}.request_id`),
       message: requiredString(command.message, `${type}.message`),
+    }
+  }
+  if (type === 'summarize') {
+    assertOnlyKeys(command, ['v', 'type', 'request_id', 'session_id', 'model'], 'summarize command')
+    return {
+      v: PROTOCOL_VERSION,
+      type,
+      request_id: requiredString(command.request_id, 'summarize.request_id'),
+      session_id: requiredString(command.session_id, 'summarize.session_id'),
+      ...parseModel(command.model) === undefined ? {} : { model: parseModel(command.model) },
     }
   }
   if (type === 'execute') {

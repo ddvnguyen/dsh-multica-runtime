@@ -10,6 +10,7 @@ import {
   type ModelSelection,
   type ModelSelectionRef,
 } from '@deepseek-ai/dsh-agent'
+import type {} from '@deepseek-ai/dsh-compaction'
 import { createUserMessage, ReasoningEffortId, type ContentBlock, type UserMessage } from '@deepseek-ai/dsh-llm'
 import * as McpClient from '@deepseek-ai/dsh-mcp-client'
 import { SessionId, type SessionEvent, type TurnEndReason } from '@deepseek-ai/dsh-session'
@@ -28,6 +29,7 @@ import {
   truncateUtf8,
   type AnswerCommand,
   type ExecuteCommand,
+  type FirstCommand,
   type InboxStateFrame,
   type McpServerInput,
   type OutboundFrame,
@@ -38,6 +40,7 @@ import {
   type RuntimeQuestion,
   type RuntimeQuestionIntent,
   type SteerCommand,
+  type SummarizeCommand,
 } from './protocol.js'
 import { installMulticaTerminalEnvironment } from './environment.js'
 import { settleCancelled as settleCancelledAgent, waitForQuiescence, type SubagentLifecycle } from './lifecycle.js'
@@ -45,7 +48,7 @@ import { settleCancelled as settleCancelledAgent, waitForQuiescence, type Subage
 export const name = 'multica-dsh-runtime'
 export const inject = ['cmdlineArgs', 'agents', 'agentDefaultModel', 'sessions', 'llm']
 
-const PLUGIN_VERSION = '0.2.0-private.2'
+const PLUGIN_VERSION = '0.2.0-private.3'
 
 interface ActiveRun {
   command: ExecuteCommand
@@ -319,7 +322,10 @@ async function listModels(ctx: Context): Promise<RuntimeModelFrame[]> {
   return result.sort((a, b) => a.provider.localeCompare(b.provider) || a.label.localeCompare(b.label))
 }
 
-async function resolveSelection(ctx: Context, command: ExecuteCommand): Promise<ModelSelection> {
+async function resolveSelection(
+  ctx: Context,
+  command: Pick<ExecuteCommand, 'model' | 'reasoning_effort'>,
+): Promise<ModelSelection> {
   const defaultModel = ctx.get('agentDefaultModel')
   const llm = ctx.get('llm')
   if (defaultModel === undefined || llm === undefined) throw new Error('DSH model services are unavailable')
@@ -659,6 +665,104 @@ async function execute(ctx: Context, active: ActiveRun): Promise<number> {
   }
 }
 
+/**
+ * One `summarize` first command (S3-B1): resume the idle session and run
+ * dsh's own compaction over it, then report the summary on the `summary`
+ * frame. The compaction replaces the session's long history span with the
+ * summary node in place — the next resume reads the small summary, warm —
+ * and the daemon stores the text beside the session. The process exits right
+ * after the result frame: no idle session ever keeps this bridge alive.
+ */
+async function summarize(ctx: Context, command: SummarizeCommand): Promise<number> {
+  const sessions = ctx.get('sessions')
+  const compaction = ctx.get('compaction')
+  if (sessions === undefined || compaction === undefined) {
+    writeFrame({
+      v: PROTOCOL_VERSION,
+      type: 'result',
+      request_id: command.request_id,
+      status: 'failed',
+      output: '',
+      resume_rejected: false,
+      error: { code: 'DSH_SUMMARIZE_UNAVAILABLE', message: 'DSH compaction services are unavailable in this runtime' },
+    })
+    return 1
+  }
+  let handle: AgentHandle | undefined
+  try {
+    const agents = ctx.get('agents')
+    if (agents === undefined) throw new Error('DSH agent registry is unavailable')
+    const selection = await resolveSelection(ctx, command)
+    const options = { provider: selection.provider, model: selection.model }
+    handle = await agents.resume({
+      resumeSessionId: SessionId(command.session_id),
+      agentOptions: options,
+      setup: (agentCtx: Context): void => {
+        installModelSelection(agentCtx, { current: selection, assembled: undefined } satisfies ModelSelectionRef)
+        // Compaction makes one model call; headless there is nobody to ask,
+        // same allow-once posture the execute path takes.
+        agentCtx.on('approval/request', (_request, next) =>
+          Promise.resolve<ApprovalOutcome>('allowed-once').catch(() => next()))
+      },
+    })
+    await handle.agent.whenIdle()
+    const agent = handle.agent
+    const result = await compaction.compactNow({
+      session: agent.session,
+      options,
+      runMaintenance: <T>(task: (signal: AbortSignal) => Promise<T>): Promise<T> => agent.runMaintenance(task),
+    }, new AbortController().signal)
+    if (result === null) {
+      throw new Error('the session has no compactable history yet')
+    }
+    const text = result.summary
+      .filter(block => block.type === 'text')
+      .map(block => block.text)
+      .join('')
+    const sessionId = String(agent.session.id)
+    await sessions.flush(agent.session)
+    await handle.dispose()
+    handle = undefined
+    writeFrame({
+      v: PROTOCOL_VERSION,
+      type: 'summary',
+      request_id: command.request_id,
+      session_id: sessionId,
+      summary: text,
+      summary_tokens: Math.ceil(text.length / 4),
+    })
+    writeFrame({
+      v: PROTOCOL_VERSION,
+      type: 'result',
+      request_id: command.request_id,
+      status: 'completed',
+      session_id: sessionId,
+      output: '',
+      resume_rejected: false,
+    })
+    return 0
+  } catch (error: unknown) {
+    if (handle !== undefined) {
+      try {
+        await sessions.flush(handle.agent.session)
+        await handle.dispose()
+      } catch (cleanupError: unknown) {
+        writeDiagnostic(`summarize cleanup failed: ${errorMessage(cleanupError)}`)
+      }
+    }
+    writeFrame({
+      v: PROTOCOL_VERSION,
+      type: 'result',
+      request_id: command.request_id,
+      status: 'failed',
+      output: '',
+      resume_rejected: false,
+      error: { code: 'DSH_SUMMARIZE_FAILED', message: errorMessage(error) },
+    })
+    return 1
+  }
+}
+
 async function stdio(ctx: Context): Promise<number> {
   const forwarding = await installMulticaTerminalEnvironment(ctx)
   if (forwarding !== undefined && !forwarding.forwarded) {
@@ -675,30 +779,30 @@ async function stdio(ctx: Context): Promise<number> {
   })
 
   const input = createInterface({ input: process.stdin, terminal: false, crlfDelay: Infinity })
-  let resolveExecute: ((command: ExecuteCommand) => void) | undefined
-  let rejectExecute: ((error: Error) => void) | undefined
-  const firstExecute = new Promise<ExecuteCommand>((resolveCommand, rejectCommand) => {
-    resolveExecute = resolveCommand
-    rejectExecute = rejectCommand
-  })
+  const firstCommand = Promise.withResolvers<FirstCommand>()
+  let resolveExecute: ((command: FirstCommand) => void) | undefined = firstCommand.resolve
+  let rejectExecute: ((error: Error) => void) | undefined = firstCommand.reject
+  const firstExecute = firstCommand.promise
   input.on('line', (line) => {
     try {
       const command = parseInboundCommand(line)
-      if (command.type === 'execute') {
+      if (command.type === 'execute' || command.type === 'summarize') {
         if (activeRef.current !== undefined || resolveExecute === undefined) {
-          protocolError('DUPLICATE_EXECUTE', 'this DSH process accepts exactly one execute command')
+          protocolError('DUPLICATE_EXECUTE', 'this DSH process accepts exactly one first command')
           return
         }
-        const active: ActiveRun = {
-          command,
-          firstSeq: Number.MAX_SAFE_INTEGER,
-          cancelRequested: false,
-          cancel: new AbortController(),
-          lastText: '',
-          toolNames: new Map(),
-          inbox: { pending: [] },
+        if (command.type === 'execute') {
+          const active: ActiveRun = {
+            command,
+            firstSeq: Number.MAX_SAFE_INTEGER,
+            cancelRequested: false,
+            cancel: new AbortController(),
+            lastText: '',
+            toolNames: new Map(),
+            inbox: { pending: [] },
+          }
+          activeRef.current = active
         }
-        activeRef.current = active
         const resolveCommand = resolveExecute
         resolveExecute = undefined
         rejectExecute = undefined
@@ -764,15 +868,22 @@ async function stdio(ctx: Context): Promise<number> {
       questions: true,
       steer: true,
       queue: true,
+      summarize: true,
       mcp: ['stdio', 'streamable-http'],
     },
   })
+  let first: FirstCommand
   try {
-    await firstExecute
+    first = await firstExecute
   } catch (error: unknown) {
     writeDiagnostic(errorMessage(error))
     input.close()
     return 1
+  }
+  if (first.type === 'summarize') {
+    const code = await summarize(ctx, first)
+    input.close()
+    return code
   }
   const active = activeRef.current
   if (active === undefined) return 1
