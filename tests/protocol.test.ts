@@ -214,3 +214,60 @@ describe('wire helpers', () => {
     expect(line.slice(0, -1)).not.toContain('\n')
   })
 })
+
+describe('summarize command (S3-B1)', () => {
+  it('parses a summarize first command with an optional model', () => {
+    expect(parseInboundCommand(JSON.stringify({
+      v: 1,
+      type: 'summarize',
+      request_id: 'task-1',
+      session_id: 'session-1',
+    }))).toEqual({
+      v: 1,
+      type: 'summarize',
+      request_id: 'task-1',
+      session_id: 'session-1',
+    })
+
+    expect(parseInboundCommand(JSON.stringify({
+      v: 1,
+      type: 'summarize',
+      request_id: 'task-1',
+      session_id: 'session-1',
+      model: { provider: 'deepseek', id: 'v4-pro' },
+    }))).toMatchObject({ model: { provider: 'deepseek', id: 'v4-pro' } })
+  })
+
+  it('requires the session id and rejects execute-shaped extras', () => {
+    expect(() => parseInboundCommand(JSON.stringify({
+      v: 1,
+      type: 'summarize',
+      request_id: 'task-1',
+    }))).toThrow('summarize.session_id')
+
+    expect(() => parseInboundCommand(JSON.stringify({
+      v: 1,
+      type: 'summarize',
+      request_id: 'task-1',
+      session_id: 'session-1',
+      prompt: 'sneaky',
+    }))).toThrow('unsupported field')
+  })
+
+  it('encodes a summary frame as one JSON line with the token estimate field', () => {
+    const line = encodeFrame({
+      v: 1,
+      type: 'summary',
+      request_id: 'task-1',
+      session_id: 'session-1',
+      summary: 'The session did X.',
+      summary_tokens: 5,
+    })
+    expect(JSON.parse(line)).toMatchObject({
+      type: 'summary',
+      session_id: 'session-1',
+      summary: 'The session did X.',
+      summary_tokens: 5,
+    })
+  })
+})
