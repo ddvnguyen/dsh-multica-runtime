@@ -7,13 +7,23 @@ import {
   installModelSelection,
   type Agent,
   type AgentHandle,
+  type AgentRegistry,
+  type AgentSetup,
+  type CreateAgentOptions,
   type ModelSelection,
   type ModelSelectionRef,
+  type ResumeAgentOptions,
 } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-compaction'
 import { createUserMessage, ReasoningEffortId, type ContentBlock, type UserMessage } from '@deepseek-ai/dsh-llm'
 import * as McpClient from '@deepseek-ai/dsh-mcp-client'
-import { SessionId, type SessionEvent, type TurnEndReason } from '@deepseek-ai/dsh-session'
+import {
+  SessionId,
+  SessionLogOffset,
+  SessionSeq,
+  type SessionEvent,
+  type TurnEndReason,
+} from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/cordis-plugin-loader'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
 import type {} from '@deepseek-ai/dsh-cmdline'
@@ -519,6 +529,113 @@ function resultFromReason(active: ActiveRun): Omit<Extract<OutboundFrame, { type
   }
 }
 
+/**
+ * The inherited history of a summary-seeded session (S3-B2/M-138): ONE
+ * user-message event carrying the parent's summary and this run's trigger.
+ *
+ * dsh's fork primitive replays a parent prefix; a cold parent's transcript is
+ * exactly what the summary replaced, so replaying it would defeat the point.
+ * The seed is therefore a single synthetic message at seq 0 — the child reads
+ * it as the human's hand-over and then receives this run's prompt as usual.
+ */
+export function buildSummarySeed(text: string, now: number = Date.now()): SessionEvent[] {
+  return [{
+    type: 'user/message',
+    seq: SessionSeq(0),
+    time: now,
+    data: createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } }),
+    surfaceOp: 'append',
+  }]
+}
+
+/**
+ * The `agents.create` options for a summary-seeded child: the seed above, its
+ * inherited length, and the fork lineage (`parentSession` + `isSeeded`) that
+ * makes the child's provenance readable after the fact.
+ */
+export function seededCreateOptions(input: {
+  cwd: string
+  forkParent: string
+  seed: string
+  agentOptions: { provider: string; model: string }
+  setup: AgentSetup
+  now?: number
+}): CreateAgentOptions {
+  const seed = buildSummarySeed(input.seed, input.now)
+  return {
+    sessionId: SessionId(`multica-${randomUUID()}`),
+    seed,
+    inheritedEventCount: SessionLogOffset(seed.length),
+    meta: {
+      cwd: input.cwd,
+      parentSession: SessionId(input.forkParent),
+      isSeeded: true,
+    },
+    agentOptions: input.agentOptions,
+    setup: input.setup,
+  }
+}
+
+/** How a seeded start ended: the fork landed, or the named fallback resumed the parent. */
+export type SeededStart =
+  | { kind: 'forked'; handle: AgentHandle }
+  | { kind: 'resumed'; handle: AgentHandle; reason: string }
+
+/**
+ * Start a session seeded from a summary, falling back to resuming the parent
+ * when dsh refuses the seed.
+ *
+ * The fallback is the named one the daemon's run row depends on: a rejected
+ * seed must not fail the run, and the caller reports it as a resume (the
+ * `session` frame's `resumed: true`), so the row says "resumed warm" rather
+ * than claiming a seed that never landed.
+ */
+export async function startSeeded(
+  create: (options: CreateAgentOptions) => Promise<AgentHandle>,
+  resumeParent: () => Promise<AgentHandle>,
+  input: {
+    cwd: string
+    forkParent: string
+    seed: string
+    agentOptions: { provider: string; model: string }
+    setup: AgentSetup
+    now?: number
+  },
+): Promise<SeededStart> {
+  try {
+    return { kind: 'forked', handle: await create(seededCreateOptions(input)) }
+  } catch (error: unknown) {
+    const reason = errorMessage(error)
+    writeDiagnostic(`seeded start rejected for ${input.forkParent} (${reason}); resuming it instead`)
+    return { kind: 'resumed', handle: await resumeParent(), reason }
+  }
+}
+
+/**
+ * Resume one persisted session in this run's working directory. A resume that
+ * cannot load, or that loads a session created elsewhere, is a
+ * ResumeRejectedError so the daemon can tell "the conversation is gone" from
+ * "the runtime failed".
+ */
+async function resumeAgent(
+  agents: AgentRegistry,
+  options: ResumeAgentOptions,
+  cwd: string,
+): Promise<AgentHandle> {
+  const sessionId = String(options.resumeSessionId)
+  let handle: AgentHandle
+  try {
+    handle = await agents.resume(options)
+  } catch (error: unknown) {
+    throw new ResumeRejectedError(`could not resume DSH session ${sessionId}`, { cause: error })
+  }
+  if (!await sameDirectory(handle.agent.session.header.cwd, cwd)) {
+    await handle.dispose()
+    throw new ResumeRejectedError('the resumed DSH session belongs to a different working directory')
+  }
+  return handle
+}
+
 async function createOrResumeAgent(
   ctx: Context,
   active: ActiveRun,
@@ -569,6 +686,24 @@ async function createOrResumeAgent(
     }
   }
   const options = { provider: selection.provider, model: selection.model }
+  if (active.command.fork_parent !== undefined) {
+    // S3-B2 (M-138): a cold parent with a fresh summary. Fork a NEW session
+    // seeded with the summary text; the daemon keeps the parent's id as the
+    // fallback and records whichever of the two actually happened.
+    const forkParent = active.command.fork_parent
+    const start = await startSeeded(
+      candidate => agents.create(candidate),
+      () => resumeAgent(agents, { resumeSessionId: SessionId(forkParent), agentOptions: options, setup }, active.command.cwd),
+      {
+        cwd: active.command.cwd,
+        forkParent,
+        seed: active.command.seed ?? '',
+        agentOptions: options,
+        setup,
+      },
+    )
+    return { handle: start.handle, resumed: start.kind === 'resumed' }
+  }
   if (active.command.resume_session_id === undefined) {
     const handle = await agents.create({
       sessionId: SessionId(`multica-${randomUUID()}`),
@@ -578,20 +713,11 @@ async function createOrResumeAgent(
     })
     return { handle, resumed: false }
   }
-  let handle: AgentHandle
-  try {
-    handle = await agents.resume({
-      resumeSessionId: SessionId(active.command.resume_session_id),
-      agentOptions: options,
-      setup,
-    })
-  } catch (error: unknown) {
-    throw new ResumeRejectedError(`could not resume DSH session ${active.command.resume_session_id}`, { cause: error })
-  }
-  if (!await sameDirectory(handle.agent.session.header.cwd, active.command.cwd)) {
-    await handle.dispose()
-    throw new ResumeRejectedError('the resumed DSH session belongs to a different working directory')
-  }
+  const handle = await resumeAgent(
+    agents,
+    { resumeSessionId: SessionId(active.command.resume_session_id), agentOptions: options, setup },
+    active.command.cwd,
+  )
   return { handle, resumed: true }
 }
 
@@ -869,6 +995,8 @@ async function stdio(ctx: Context): Promise<number> {
       steer: true,
       queue: true,
       summarize: true,
+      // S3-B2 (M-138): seeded starts — `execute.fork_parent` + `execute.seed`.
+      fork: true,
       mcp: ['stdio', 'streamable-http'],
     },
   })
