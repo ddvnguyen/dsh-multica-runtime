@@ -271,3 +271,32 @@ describe('summarize command (S3-B1)', () => {
     })
   })
 })
+
+describe('session id validation (F17)', () => {
+  it('rejects dot-only session ids for summarize, fork_parent and resume_session_id', () => {
+    expect(() => parseInboundCommand(JSON.stringify({
+      v: 1, type: 'summarize', request_id: 'r', session_id: '.',
+    }))).toThrow(/session id/)
+    expect(() => parseInboundCommand(JSON.stringify({
+      v: 1, type: 'summarize', request_id: 'r', session_id: '..',
+    }))).toThrow(/session id/)
+
+    expect(() => parseInboundCommand(JSON.stringify({
+      v: 1, type: 'execute', request_id: 'r', cwd: '/w', prompt: 'p', mcp_servers: [],
+      fork_parent: '.', seed: 's',
+    }))).toThrow(/session id/)
+    expect(() => parseInboundCommand(JSON.stringify({
+      v: 1, type: 'execute', request_id: 'r', cwd: '/w', prompt: 'p', mcp_servers: [],
+      fork_parent: '..', seed: 's',
+    }))).toThrow(/session id/)
+
+    expect(() => parseInboundCommand(JSON.stringify({
+      v: 1, type: 'execute', request_id: 'r', cwd: '/w', prompt: 'p', mcp_servers: [],
+      resume_session_id: '.',
+    }))).toThrow(/session id/)
+    expect(() => parseInboundCommand(JSON.stringify({
+      v: 1, type: 'execute', request_id: 'r', cwd: '/w', prompt: 'p', mcp_servers: [],
+      resume_session_id: '..',
+    }))).toThrow(/session id/)
+  })
+})

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { dispatchInbound, inboxBoundaryFrames, type InboxAgent, type RunRef } from '../src/index.js'
+import { dispatchInbound, inboxBoundaryFrames, rejectPendingInbox, type InboxAgent, type RunRef } from '../src/index.js'
 import { PROTOCOL_VERSION, type QueueCommand, type SteerCommand } from '../src/protocol.js'
 
 function steerCommand(request_id = 'req-1'): SteerCommand {
@@ -152,5 +152,55 @@ describe('inboxBoundaryFrames', () => {
     expect(inboxBoundaryFrames(run.inbox, 'req-1', 'assistant/message', 11)).toEqual([])
     expect(inboxBoundaryFrames(run.inbox, 'req-1', 'turn/end', 12)).toEqual([])
     expect(run.inbox.pending).toHaveLength(1)
+  })
+})
+
+describe('dispatchInbound: run_finished on cancel/teardown', () => {
+  it('rejects steer and queue when cancelRequested is set', () => {
+    const { agent } = makeAgent()
+    const run = makeRun(agent, { cancelRequested: true })
+
+    expect(dispatchInbound(run, steerCommand())).toMatchObject({
+      kind: 'reject',
+      frame: { state: 'rejected', reason: 'run_finished' },
+    })
+    expect(dispatchInbound(run, queueCommand())).toMatchObject({
+      kind: 'reject',
+      frame: { state: 'rejected', reason: 'run_finished' },
+    })
+  })
+
+  it('rejects steer and queue during teardown', () => {
+    const { agent } = makeAgent()
+    const run = makeRun(agent, { teardown: true })
+
+    expect(dispatchInbound(run, steerCommand())).toMatchObject({
+      kind: 'reject',
+      frame: { state: 'rejected', reason: 'run_finished' },
+    })
+  })
+})
+
+describe('rejectPendingInbox', () => {
+  it('emits rejected:run_finished for pending entries and clears them', () => {
+    const { agent } = makeAgent()
+    const run = makeRun(agent)
+    dispatchInbound(run, steerCommand())
+    dispatchInbound(run, queueCommand())
+    expect(run.inbox.pending).toHaveLength(2)
+
+    const writes: string[] = []
+    const spy = vi.spyOn(process.stdout, 'write').mockImplementation((chunk: any) => {
+      writes.push(String(chunk))
+      return true
+    })
+    const active: any = { command: { request_id: 'req-1' }, inbox: run.inbox }
+    rejectPendingInbox(active)
+    spy.mockRestore()
+
+    expect(run.inbox.pending).toHaveLength(0)
+    const frames = writes.map(line => JSON.parse(line))
+    expect(frames).toHaveLength(2)
+    expect(frames.every((frame: any) => frame.type === 'inbox_state' && frame.state === 'rejected' && frame.reason === 'run_finished')).toBe(true)
   })
 })

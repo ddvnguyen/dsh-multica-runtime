@@ -19,6 +19,7 @@ import { createUserMessage, ReasoningEffortId, type ContentBlock, type UserMessa
 import * as McpClient from '@deepseek-ai/dsh-mcp-client'
 import {
   SessionId,
+  SessionForkError,
   SessionLogOffset,
   SessionSeq,
   type SessionEvent,
@@ -65,6 +66,7 @@ interface ActiveRun {
   agent?: Agent
   firstSeq: number
   cancelRequested: boolean
+  teardown: boolean
   /** Aborted on cancel so a pending subagent wait cannot hold the result frame. */
   cancel: AbortController
   lastText: string
@@ -166,6 +168,8 @@ export interface InboxTracker {
 export interface RunRef {
   requestId: string
   finished: boolean
+  cancelRequested?: boolean
+  teardown?: boolean
   agent?: InboxAgent
   inbox: InboxTracker
 }
@@ -203,7 +207,7 @@ export function dispatchInbound(run: RunRef | undefined, command: PostExecuteCom
   if (command.type === 'steer' || command.type === 'queue') {
     if (run === undefined) return rejectedInboxFrame(command, 'agent_not_ready')
     if (command.request_id !== run.requestId) return rejectedInboxFrame(command, 'unknown_request_id')
-    if (run.finished) return rejectedInboxFrame(command, 'run_finished')
+    if (run.finished || run.cancelRequested === true || run.teardown === true) return rejectedInboxFrame(command, 'run_finished')
     if (run.agent === undefined) return rejectedInboxFrame(command, 'agent_not_ready')
     const message = createUserMessage({ content: [{ type: 'text', text: command.message }], source: { kind: 'user' } })
     const pending: PendingInboxEntry = { command: command.type, message, acceptedSeq: run.agent.session.seq }
@@ -605,6 +609,9 @@ export async function startSeeded(
   try {
     return { kind: 'forked', handle: await create(seededCreateOptions(input)) }
   } catch (error: unknown) {
+    if (!(error instanceof SessionForkError)) {
+      throw error
+    }
     const reason = errorMessage(error)
     writeDiagnostic(`seeded start rejected for ${input.forkParent} (${reason}); resuming it instead`)
     return { kind: 'resumed', handle: await resumeParent(), reason }
@@ -721,6 +728,20 @@ async function createOrResumeAgent(
   return { handle, resumed: true }
 }
 
+export function rejectPendingInbox(active: ActiveRun): void {
+  for (const entry of active.inbox.pending) {
+    writeFrame({
+      v: PROTOCOL_VERSION,
+      type: 'inbox_state',
+      request_id: active.command.request_id,
+      command: entry.command,
+      state: 'rejected',
+      reason: 'run_finished',
+    })
+  }
+  active.inbox.pending = []
+}
+
 async function execute(ctx: Context, active: ActiveRun): Promise<number> {
   const sessions = ctx.get('sessions')
   if (sessions === undefined) throw new Error('DSH session service is unavailable')
@@ -750,8 +771,10 @@ async function execute(ctx: Context, active: ActiveRun): Promise<number> {
     }
     if (outcome === 'cancelled' || active.cancelRequested) await settleCancelled(ctx, handle.agent)
     else await drainDescendants(ctx, handle.agent)
+    active.teardown = true
     await sessions.flush(handle.agent.session)
     const sessionId = String(handle.agent.session.id)
+    rejectPendingInbox(active)
     const result = resultFromReason(active)
     await handle.dispose()
     handle = undefined
@@ -773,6 +796,8 @@ async function execute(ctx: Context, active: ActiveRun): Promise<number> {
         writeDiagnostic(`cleanup failed: ${errorMessage(cleanupError)}`)
       }
     }
+    active.teardown = true
+    rejectPendingInbox(active)
     const resumeRejected = error instanceof ResumeRejectedError
     const cause = error instanceof Error && error.cause !== undefined ? `: ${errorMessage(error.cause)}` : ''
     writeFrame({
@@ -922,6 +947,7 @@ async function stdio(ctx: Context): Promise<number> {
             command,
             firstSeq: Number.MAX_SAFE_INTEGER,
             cancelRequested: false,
+            teardown: false,
             cancel: new AbortController(),
             lastText: '',
             toolNames: new Map(),
@@ -939,7 +965,14 @@ async function stdio(ctx: Context): Promise<number> {
       const outcome = dispatchInbound(
         active === undefined
           ? undefined
-          : { requestId: active.command.request_id, finished: activeRef.finished, agent: active.agent, inbox: active.inbox },
+          : {
+              requestId: active.command.request_id,
+              finished: activeRef.finished,
+              cancelRequested: active.cancelRequested,
+              teardown: active.teardown,
+              agent: active.agent,
+              inbox: active.inbox,
+            },
         command,
       )
       if (outcome.kind === 'deliver' || outcome.kind === 'reject') {
@@ -994,7 +1027,7 @@ async function stdio(ctx: Context): Promise<number> {
       questions: true,
       steer: true,
       queue: true,
-      summarize: true,
+      summarize: ctx.get('compaction') !== undefined,
       // S3-B2 (M-138): seeded starts — `execute.fork_parent` + `execute.seed`.
       fork: true,
       mcp: ['stdio', 'streamable-http'],

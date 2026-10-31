@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import type { AgentHandle, CreateAgentOptions } from '@deepseek-ai/dsh-agent'
 import { buildSummarySeed, seededCreateOptions, startSeeded } from '../src/index.js'
 import { parseInboundCommand, PROTOCOL_VERSION } from '../src/protocol.js'
+import { SessionForkError } from '@deepseek-ai/dsh-session'
 
 const handle = (id: string): AgentHandle => ({ agent: { session: { id } } } as unknown as AgentHandle)
 
@@ -122,7 +123,7 @@ describe('startSeeded', () => {
   it('resumes the parent when dsh rejects the seed', async () => {
     // The named fallback: a seed dsh cannot validate must not fail the run.
     const create = vi.fn(async () => {
-      throw new Error('seed event 0 failed validation')
+      throw new SessionForkError('seed event 0 failed validation', 'INVALID_BOUNDARY')
     })
     const resumeParent = vi.fn(async () => handle('session-parent'))
 
@@ -133,5 +134,15 @@ describe('startSeeded', () => {
     expect(start.reason).toContain('seed event 0 failed validation')
     expect(resumeParent).toHaveBeenCalledTimes(1)
     expect(String(start.handle.agent.session.id)).toBe('session-parent')
+  })
+
+  it('rethrows a non-seed error instead of resuming', async () => {
+    const create = vi.fn(async () => {
+      throw new Error('MCP startup failed')
+    })
+    const resumeParent = vi.fn(async () => handle('session-parent'))
+
+    await expect(startSeeded(create, resumeParent, input)).rejects.toThrow('MCP startup failed')
+    expect(resumeParent).not.toHaveBeenCalled()
   })
 })

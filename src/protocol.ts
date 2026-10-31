@@ -181,7 +181,7 @@ export type OutboundFrame =
       questions: true,
       steer: true,
       queue: true,
-      summarize: true,
+      summarize: boolean,
       /**
        * S3-B2 (M-138): this bridge can start a session seeded from a summary
        * (`execute.fork_parent` + `execute.seed`). The daemon sends a fork only
@@ -275,6 +275,17 @@ function requiredString(value: unknown, field: string): string {
 function optionalString(value: unknown, field: string): string | undefined {
   if (value === undefined || value === null || value === '') return undefined
   return requiredString(value, field)
+}
+
+function sessionId(value: unknown, field: string): string {
+  const id = requiredString(value, field)
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id)) throw new Error(`${field} must be a valid session id`)
+  return id
+}
+
+function optionalSessionId(value: unknown, field: string): string | undefined {
+  if (value === undefined || value === null || value === '') return undefined
+  return sessionId(value, field)
 }
 
 function stringArray(value: unknown, field: string): string[] {
@@ -417,7 +428,7 @@ export function parseInboundCommand(line: string): InboundCommand {
       v: PROTOCOL_VERSION,
       type,
       request_id: requiredString(command.request_id, 'summarize.request_id'),
-      session_id: requiredString(command.session_id, 'summarize.session_id'),
+      session_id: sessionId(command.session_id, 'summarize.session_id'),
       ...parseModel(command.model) === undefined ? {} : { model: parseModel(command.model) },
     }
   }
@@ -430,7 +441,7 @@ export function parseInboundCommand(line: string): InboundCommand {
       ],
       'execute command',
     )
-    const forkParent = optionalString(command.fork_parent, 'execute.fork_parent')
+    const forkParent = optionalSessionId(command.fork_parent, 'execute.fork_parent')
     const seed = optionalString(command.seed, 'execute.seed')
     if (forkParent !== undefined && command.resume_session_id !== undefined && command.resume_session_id !== '') {
       throw new Error('execute.fork_parent and execute.resume_session_id are mutually exclusive')
@@ -447,9 +458,9 @@ export function parseInboundCommand(line: string): InboundCommand {
       request_id: requiredString(command.request_id, 'execute.request_id'),
       cwd: requiredString(command.cwd, 'execute.cwd'),
       prompt: requiredString(command.prompt, 'execute.prompt'),
-      ...optionalString(command.resume_session_id, 'execute.resume_session_id') === undefined
+      ...optionalSessionId(command.resume_session_id, 'execute.resume_session_id') === undefined
         ? {}
-        : { resume_session_id: optionalString(command.resume_session_id, 'execute.resume_session_id') },
+        : { resume_session_id: optionalSessionId(command.resume_session_id, 'execute.resume_session_id') },
       ...forkParent === undefined ? {} : { fork_parent: forkParent },
       ...seed === undefined ? {} : { seed },
       ...parseModel(command.model) === undefined ? {} : { model: parseModel(command.model) },
