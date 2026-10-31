@@ -238,6 +238,23 @@ describe('summarize command (S3-B1)', () => {
     }))).toMatchObject({ model: { provider: 'deepseek', id: 'v4-pro' } })
   })
 
+  it('parses an optional max_tokens and omits it when absent', () => {
+    const base = { v: 1, type: 'summarize', request_id: 'task-1', session_id: 'session-1' }
+    expect(parseInboundCommand(JSON.stringify({ ...base, max_tokens: 4096 })))
+      .toEqual({ ...base, max_tokens: 4096 })
+    expect(parseInboundCommand(JSON.stringify(base))).not.toHaveProperty('max_tokens')
+  })
+
+  it.each([0, -1, 1.5, '4096', null])('rejects max_tokens %j', (value) => {
+    expect(() => parseInboundCommand(JSON.stringify({
+      v: 1,
+      type: 'summarize',
+      request_id: 'task-1',
+      session_id: 'session-1',
+      max_tokens: value,
+    }))).toThrow('summarize.max_tokens')
+  })
+
   it('requires the session id and rejects execute-shaped extras', () => {
     expect(() => parseInboundCommand(JSON.stringify({
       v: 1,

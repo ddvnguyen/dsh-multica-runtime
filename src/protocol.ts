@@ -88,6 +88,12 @@ export interface QueueCommand {
  * only when it fires at TTL−margin. Additive at protocol v1: a bridge that
  * predates it never advertises the `summarize` capability, and the daemon
  * never sends the command without that advertisement.
+ *
+ * `max_tokens` is the summary size budget in tokens. It is sent only to a
+ * bridge advertising `capabilities.summarize_max_tokens`; absent means no
+ * budget. A summary whose token estimate exceeds it is not reported: the
+ * bridge fails the command with `DSH_SUMMARY_OVER_CAP` without flushing the
+ * compacted session.
  */
 export interface SummarizeCommand {
   v: typeof PROTOCOL_VERSION
@@ -95,6 +101,7 @@ export interface SummarizeCommand {
   request_id: string
   session_id: string
   model?: ModelSelectionInput
+  max_tokens?: number
 }
 
 export type FirstCommand = ExecuteCommand | SummarizeCommand
@@ -182,6 +189,8 @@ export type OutboundFrame =
       steer: true,
       queue: true,
       summarize: boolean,
+      /** `summarize.max_tokens` is honoured; true exactly when `summarize` is. */
+      summarize_max_tokens: boolean,
       /**
        * S3-B2 (M-138): this bridge can start a session seeded from a summary
        * (`execute.fork_parent` + `execute.seed`). The daemon sends a fork only
@@ -198,8 +207,8 @@ export type OutboundFrame =
   /**
    * The summary dsh's compaction produced for a `summarize` command. The
    * daemon stores it beside the session (S3-B1); `summary_tokens` is the
-   * bridge's bytes/4 estimate, good enough for the size record the decision
-   * log keeps.
+   * bridge's length/4 estimate (`summaryTokenEstimate`), good enough for the
+   * size record the decision log keeps.
    */
   | { v: typeof PROTOCOL_VERSION; type: 'summary'; request_id: string; session_id: string; summary: string; summary_tokens: number }
   | { v: typeof PROTOCOL_VERSION; type: 'text'; request_id: string; content: string }
@@ -423,13 +432,15 @@ export function parseInboundCommand(line: string): InboundCommand {
     }
   }
   if (type === 'summarize') {
-    assertOnlyKeys(command, ['v', 'type', 'request_id', 'session_id', 'model'], 'summarize command')
+    assertOnlyKeys(command, ['v', 'type', 'request_id', 'session_id', 'model', 'max_tokens'], 'summarize command')
+    const maxTokens = optionalPositiveInteger(command.max_tokens, 'summarize.max_tokens')
     return {
       v: PROTOCOL_VERSION,
       type,
       request_id: requiredString(command.request_id, 'summarize.request_id'),
       session_id: sessionId(command.session_id, 'summarize.session_id'),
       ...parseModel(command.model) === undefined ? {} : { model: parseModel(command.model) },
+      ...maxTokens === undefined ? {} : { max_tokens: maxTokens },
     }
   }
   if (type === 'execute') {

@@ -54,6 +54,13 @@ import {
   type SummarizeCommand,
 } from './protocol.js'
 import { installMulticaTerminalEnvironment } from './environment.js'
+import {
+  SUMMARY_OVER_CAP_CODE,
+  summarizeCapabilities,
+  summaryOverBudget,
+  summaryOverCapMessage,
+  summaryTokenEstimate,
+} from './summary-budget.js'
 import { settleCancelled as settleCancelledAgent, waitForQuiescence, type SubagentLifecycle } from './lifecycle.js'
 
 export const name = 'multica-dsh-runtime'
@@ -870,6 +877,21 @@ async function summarize(ctx: Context, command: SummarizeCommand): Promise<numbe
       .filter(block => block.type === 'text')
       .map(block => block.text)
       .join('')
+    // Before the flush, so this bridge does not persist an over-cap compaction itself.
+    if (command.max_tokens !== undefined && summaryOverBudget(text, command.max_tokens)) {
+      await handle.dispose()
+      handle = undefined
+      writeFrame({
+        v: PROTOCOL_VERSION,
+        type: 'result',
+        request_id: command.request_id,
+        status: 'failed',
+        output: '',
+        resume_rejected: false,
+        error: { code: SUMMARY_OVER_CAP_CODE, message: summaryOverCapMessage(text, command.max_tokens) },
+      })
+      return 1
+    }
     const sessionId = String(agent.session.id)
     await sessions.flush(agent.session)
     await handle.dispose()
@@ -880,7 +902,7 @@ async function summarize(ctx: Context, command: SummarizeCommand): Promise<numbe
       request_id: command.request_id,
       session_id: sessionId,
       summary: text,
-      summary_tokens: Math.ceil(text.length / 4),
+      summary_tokens: summaryTokenEstimate(text),
     })
     writeFrame({
       v: PROTOCOL_VERSION,
@@ -1027,7 +1049,7 @@ async function stdio(ctx: Context): Promise<number> {
       questions: true,
       steer: true,
       queue: true,
-      summarize: ctx.get('compaction') !== undefined,
+      ...summarizeCapabilities(ctx.get('compaction') !== undefined),
       // S3-B2 (M-138): seeded starts — `execute.fork_parent` + `execute.seed`.
       fork: true,
       mcp: ['stdio', 'streamable-http'],
