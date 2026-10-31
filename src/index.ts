@@ -609,7 +609,7 @@ export async function startSeeded(
   try {
     return { kind: 'forked', handle: await create(seededCreateOptions(input)) }
   } catch (error: unknown) {
-    if (!(error instanceof SessionForkError) && !(error instanceof Error && /seed/i.test(error.message))) {
+    if (!(error instanceof SessionForkError)) {
       throw error
     }
     const reason = errorMessage(error)
@@ -728,7 +728,7 @@ async function createOrResumeAgent(
   return { handle, resumed: true }
 }
 
-function rejectPendingInbox(active: ActiveRun): void {
+export function rejectPendingInbox(active: ActiveRun): void {
   for (const entry of active.inbox.pending) {
     writeFrame({
       v: PROTOCOL_VERSION,
@@ -1007,17 +1007,8 @@ async function stdio(ctx: Context): Promise<number> {
     }
   })
   input.on('close', () => {
-    const active = activeRef.current
-    if (active === undefined) {
-      if (rejectExecute !== undefined) rejectExecute(new Error('stdin closed before execute'))
-      return
-    }
-    if (!activeRef.finished) {
-      active.cancelRequested = true
-      active.pendingQuestion?.reject(new Error('the ask was cancelled before the human answered'))
-      active.pendingQuestion = undefined
-      active.cancel.abort()
-      active.agent?.cancel({ kind: 'user' })
+    if (activeRef.current === undefined && rejectExecute !== undefined) {
+      rejectExecute(new Error('stdin closed before execute'))
     }
   })
 
