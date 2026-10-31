@@ -38,6 +38,17 @@ export interface ExecuteCommand {
   cwd: string
   prompt: string
   resume_session_id?: string
+  /**
+   * S3-B2 (M-138) seeded start: fork a NEW session from `fork_parent`, seeded
+   * with `seed` instead of resuming it. Mutually exclusive with
+   * `resume_session_id` — a fork starts a child session, a resume continues the
+   * parent. Additive at protocol v1: the daemon sends both fields only after
+   * the `ready` frame advertised the `fork` capability, so a bridge that
+   * predates them never receives them.
+   */
+  fork_parent?: string
+  /** The inherited text of a forked session: the parent's summary plus this run's trigger. */
+  seed?: string
   model?: ModelSelectionInput
   reasoning_effort?: string
   mcp_servers: McpServerInput[]
@@ -171,6 +182,13 @@ export type OutboundFrame =
       steer: true,
       queue: true,
       summarize: true,
+      /**
+       * S3-B2 (M-138): this bridge can start a session seeded from a summary
+       * (`execute.fork_parent` + `execute.seed`). The daemon sends a fork only
+       * to a bridge that advertises it, so a deployment still running the
+       * previous bridge keeps resuming.
+       */
+      fork: true,
       mcp: ['stdio', 'streamable-http'],
     }
   }
@@ -406,9 +424,23 @@ export function parseInboundCommand(line: string): InboundCommand {
   if (type === 'execute') {
     assertOnlyKeys(
       command,
-      ['v', 'type', 'request_id', 'cwd', 'prompt', 'resume_session_id', 'model', 'reasoning_effort', 'mcp_servers'],
+      [
+        'v', 'type', 'request_id', 'cwd', 'prompt', 'resume_session_id',
+        'fork_parent', 'seed', 'model', 'reasoning_effort', 'mcp_servers',
+      ],
       'execute command',
     )
+    const forkParent = optionalString(command.fork_parent, 'execute.fork_parent')
+    const seed = optionalString(command.seed, 'execute.seed')
+    if (forkParent !== undefined && command.resume_session_id !== undefined && command.resume_session_id !== '') {
+      throw new Error('execute.fork_parent and execute.resume_session_id are mutually exclusive')
+    }
+    if (forkParent !== undefined && seed === undefined) {
+      throw new Error('execute.fork_parent requires execute.seed')
+    }
+    if (forkParent === undefined && seed !== undefined) {
+      throw new Error('execute.seed requires execute.fork_parent')
+    }
     return {
       v: PROTOCOL_VERSION,
       type,
@@ -418,6 +450,8 @@ export function parseInboundCommand(line: string): InboundCommand {
       ...optionalString(command.resume_session_id, 'execute.resume_session_id') === undefined
         ? {}
         : { resume_session_id: optionalString(command.resume_session_id, 'execute.resume_session_id') },
+      ...forkParent === undefined ? {} : { fork_parent: forkParent },
+      ...seed === undefined ? {} : { seed },
       ...parseModel(command.model) === undefined ? {} : { model: parseModel(command.model) },
       ...optionalString(command.reasoning_effort, 'execute.reasoning_effort') === undefined
         ? {}
