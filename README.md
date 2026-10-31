@@ -71,6 +71,13 @@ The runtime contract includes:
   or `rejected` with a reason — a command naming another request or a finished
   run never reaches the agent (which keeps `cancel` per session), and a
   malformed line is reported as `protocol_error` without ending the run;
+- summarize: inbound `summarize` compacts an idle session and reports the
+  summary on a `summary` frame (`capabilities.summarize`); an optional
+  `max_tokens` (positive integer, sent only to a bridge advertising
+  `capabilities.summarize_max_tokens`) caps the summary size. If the summary's
+  token estimate (`ceil(length / 4)`) exceeds it, no `summary` frame is sent
+  and the run ends `failed` with error code `DSH_SUMMARY_OVER_CAP`, and this
+  bridge does not flush the compacted session; equal to `max_tokens` is within budget;
 - narrowly forwards only Multica's server-minted `mat_` task token into DSH's
   otherwise credential-scrubbed shell, so in-task `multica` commands retain
   task attribution without exposing model-provider credentials.
