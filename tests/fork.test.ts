@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { AgentHandle, CreateAgentOptions } from '@deepseek-ai/dsh-agent'
-import { buildSummarySeed, seededCreateOptions, startSeeded } from '../src/index.js'
+import { SEEDED_SUMMARY_HEADER, seededCreateOptions, seededPrompt, startSeeded } from '../src/index.js'
 import { parseInboundCommand, PROTOCOL_VERSION } from '../src/protocol.js'
 import { SessionForkError } from '@deepseek-ai/dsh-session'
 
@@ -58,44 +58,42 @@ describe('parseInboundCommand: seeded start (S3-B2)', () => {
   })
 })
 
-describe('buildSummarySeed', () => {
-  it('seeds one inherited user message at seq 0', () => {
-    const seed = buildSummarySeed('Summary of the earlier conversation.\n\nNew trigger:\n\ncarry on', 1_700_000_000_000)
-    expect(seed).toHaveLength(1)
-    const [event] = seed
-    expect(event).toMatchObject({
-      type: 'user/message',
-      seq: 0,
-      time: 1_700_000_000_000,
-      surfaceOp: 'append',
+describe('seededPrompt', () => {
+  it('opens with the parent summary, attributed, then this run\'s request', () => {
+    const prompt = seededPrompt({
+      forkParent: 'session-parent',
+      seed: 'Summary of the earlier conversation.\n\nNew trigger:\n\ncarry on',
+      prompt: 'carry on',
     })
-    if (event.type !== 'user/message') throw new Error(`seed event is ${event.type}`)
-    expect(event.data.content).toEqual([{
-      type: 'text',
-      text: 'Summary of the earlier conversation.\n\nNew trigger:\n\ncarry on',
-    }])
+
+    expect(prompt.startsWith(`${SEEDED_SUMMARY_HEADER} (session-parent):\n\n`)).toBe(true)
+    expect(prompt).toContain('Summary of the earlier conversation.')
+    expect(prompt.endsWith('---\n\ncarry on')).toBe(true)
+  })
+
+  it('leaves the request alone when there is no summary text', () => {
+    expect(seededPrompt({ forkParent: 'session-parent', seed: '   ', prompt: 'carry on' })).toBe('carry on')
   })
 })
 
 describe('seededCreateOptions', () => {
-  it('links the child to its parent and marks it seeded', () => {
+  it('creates a plain child linked to its parent, with no seed events', () => {
+    // M-225: seeding the log made the child unreadable, so the summary travels
+    // as prompt text and the session starts like any other.
     const options = seededCreateOptions({
       cwd: '/work',
       forkParent: 'session-parent',
-      seed: 'summary',
       agentOptions: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
       setup: () => undefined,
-      now: 1_700_000_000_000,
     })
     expect(String(options.sessionId)).toMatch(/^multica-/)
     expect(String(options.sessionId)).not.toBe('session-parent')
     expect(options.meta).toEqual({
       cwd: '/work',
       parentSession: 'session-parent',
-      isSeeded: true,
     })
-    expect(options.inheritedEventCount).toBe(1)
-    expect(options.seed).toHaveLength(1)
+    expect(options.seed).toBeUndefined()
+    expect(options.inheritedEventCount).toBeUndefined()
   })
 })
 
@@ -103,12 +101,11 @@ describe('startSeeded', () => {
   const input = {
     cwd: '/work',
     forkParent: 'session-parent',
-    seed: 'summary',
     agentOptions: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
     setup: () => undefined,
   }
 
-  it('forks when dsh accepts the seed', async () => {
+  it('creates the child when dsh accepts it', async () => {
     const create = vi.fn(async (_options: CreateAgentOptions) => handle('session-child'))
     const resumeParent = vi.fn(async () => handle('session-parent'))
 
@@ -117,11 +114,11 @@ describe('startSeeded', () => {
     expect(start.kind).toBe('forked')
     expect(create).toHaveBeenCalledTimes(1)
     expect(resumeParent).not.toHaveBeenCalled()
-    expect(create.mock.calls[0][0].meta).toMatchObject({ parentSession: 'session-parent', isSeeded: true })
+    expect(create.mock.calls[0][0].meta).toMatchObject({ parentSession: 'session-parent' })
   })
 
-  it('resumes the parent when dsh rejects the seed', async () => {
-    // The named fallback: a seed dsh cannot validate must not fail the run.
+  it('resumes the parent when dsh refuses to create the child', async () => {
+    // The named fallback: a refused child must not fail the run.
     const create = vi.fn(async () => {
       throw new SessionForkError('seed event 0 failed validation', 'INVALID_BOUNDARY')
     })

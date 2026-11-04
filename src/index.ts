@@ -20,8 +20,6 @@ import * as McpClient from '@deepseek-ai/dsh-mcp-client'
 import {
   SessionId,
   SessionForkError,
-  SessionLogOffset,
-  SessionSeq,
   type SessionEvent,
   type TurnEndReason,
 } from '@deepseek-ai/dsh-session'
@@ -541,65 +539,67 @@ function resultFromReason(active: ActiveRun): Omit<Extract<OutboundFrame, { type
 }
 
 /**
- * The inherited history of a summary-seeded session (S3-B2/M-138): ONE
- * user-message event carrying the parent's summary and this run's trigger.
- *
- * dsh's fork primitive replays a parent prefix; a cold parent's transcript is
- * exactly what the summary replaced, so replaying it would defeat the point.
- * The seed is therefore a single synthetic message at seq 0 — the child reads
- * it as the human's hand-over and then receives this run's prompt as usual.
+ * Header a summary-seeded run opens with (S3-B2/M-138). It names the parent so
+ * the child's first user turn says where the handed-over context came from.
  */
-export function buildSummarySeed(text: string, now: number = Date.now()): SessionEvent[] {
-  return [{
-    type: 'user/message',
-    seq: SessionSeq(0),
-    time: now,
-    data: createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } }),
-    surfaceOp: 'append',
-  }]
+export const SEEDED_SUMMARY_HEADER = 'Summary of the previous session'
+
+/**
+ * The first prompt of a summary-seeded run: the parent's summary, delimited and
+ * attributed, followed by this run's own request.
+ *
+ * The summary reaches the child as prompt text, never as a seed event. dsh's
+ * released v4 reader protects the first surface node for the system prompt: a
+ * log whose first surface is a synthetic user message cannot admit the system
+ * message that follows, so a seeded session built that way is write-only — it
+ * cannot be resumed or summarized (M-225, found on lane z by M-177). Prompting
+ * keeps the child's log indistinguishable from a fresh session's while the
+ * model still reads the summary first.
+ */
+export function seededPrompt(input: { forkParent: string; seed: string; prompt: string }): string {
+  const seed = input.seed.trim()
+  if (seed === '') return input.prompt
+  return `${SEEDED_SUMMARY_HEADER} (${input.forkParent}):\n\n${seed}\n\n---\n\n${input.prompt}`
 }
 
 /**
- * The `agents.create` options for a summary-seeded child: the seed above, its
- * inherited length, and the fork lineage (`parentSession` + `isSeeded`) that
- * makes the child's provenance readable after the fact.
+ * The `agents.create` options for a summary-seeded child: a plain session with
+ * no seed events, carrying the fork lineage (`parentSession`) so the child's
+ * provenance stays readable after the fact.
+ *
+ * `isSeeded` is deliberately absent: dsh ties that header flag to inherited
+ * events and rejects the combination without a seed (`Session.create`).
  */
 export function seededCreateOptions(input: {
   cwd: string
   forkParent: string
-  seed: string
   agentOptions: { provider: string; model: string }
   setup: AgentSetup
-  now?: number
 }): CreateAgentOptions {
-  const seed = buildSummarySeed(input.seed, input.now)
   return {
     sessionId: SessionId(`multica-${randomUUID()}`),
-    seed,
-    inheritedEventCount: SessionLogOffset(seed.length),
     meta: {
       cwd: input.cwd,
       parentSession: SessionId(input.forkParent),
-      isSeeded: true,
     },
     agentOptions: input.agentOptions,
     setup: input.setup,
   }
 }
 
-/** How a seeded start ended: the fork landed, or the named fallback resumed the parent. */
+/** How a seeded start ended: the child was created, or the named fallback resumed the parent. */
 export type SeededStart =
   | { kind: 'forked'; handle: AgentHandle }
   | { kind: 'resumed'; handle: AgentHandle; reason: string }
 
 /**
  * Start a session seeded from a summary, falling back to resuming the parent
- * when dsh refuses the seed.
+ * when dsh refuses to create the child.
  *
- * The fallback is the named one the daemon's run row depends on: a rejected
- * seed must not fail the run, and the caller reports it as a resume (the
+ * The fallback is the named one the daemon's run row depends on: a refused
+ * child must not fail the run, and the caller reports it as a resume (the
  * `session` frame's `resumed: true`), so the row says "resumed warm" rather
- * than claiming a seed that never landed.
+ * than claiming a seeded start that never landed.
  */
 export async function startSeeded(
   create: (options: CreateAgentOptions) => Promise<AgentHandle>,
@@ -607,10 +607,8 @@ export async function startSeeded(
   input: {
     cwd: string
     forkParent: string
-    seed: string
     agentOptions: { provider: string; model: string }
     setup: AgentSetup
-    now?: number
   },
 ): Promise<SeededStart> {
   try {
@@ -654,7 +652,7 @@ async function createOrResumeAgent(
   ctx: Context,
   active: ActiveRun,
   selection: ModelSelection,
-): Promise<{ handle: AgentHandle; resumed: boolean }> {
+): Promise<{ handle: AgentHandle; resumed: boolean; prompt: string }> {
   const agents = ctx.get('agents')
   if (agents === undefined) throw new Error('DSH agent registry is unavailable')
   const selected: ModelSelectionRef = { current: selection, assembled: undefined }
@@ -701,9 +699,10 @@ async function createOrResumeAgent(
   }
   const options = { provider: selection.provider, model: selection.model }
   if (active.command.fork_parent !== undefined) {
-    // S3-B2 (M-138): a cold parent with a fresh summary. Fork a NEW session
-    // seeded with the summary text; the daemon keeps the parent's id as the
-    // fallback and records whichever of the two actually happened.
+    // S3-B2 (M-138): a cold parent with a fresh summary. Create a NEW session
+    // and open it with the summary as prompt text (M-225); the daemon keeps the
+    // parent's id as the fallback and records whichever of the two actually
+    // happened.
     const forkParent = active.command.fork_parent
     const start = await startSeeded(
       candidate => agents.create(candidate),
@@ -711,12 +710,19 @@ async function createOrResumeAgent(
       {
         cwd: active.command.cwd,
         forkParent,
-        seed: active.command.seed ?? '',
         agentOptions: options,
         setup,
       },
     )
-    return { handle: start.handle, resumed: start.kind === 'resumed' }
+    return {
+      handle: start.handle,
+      resumed: start.kind === 'resumed',
+      // A resumed parent already holds the history the summary describes; only
+      // the child needs the hand-over text.
+      prompt: start.kind === 'resumed'
+        ? active.command.prompt
+        : seededPrompt({ forkParent, seed: active.command.seed ?? '', prompt: active.command.prompt }),
+    }
   }
   if (active.command.resume_session_id === undefined) {
     const handle = await agents.create({
@@ -725,14 +731,14 @@ async function createOrResumeAgent(
       agentOptions: options,
       setup,
     })
-    return { handle, resumed: false }
+    return { handle, resumed: false, prompt: active.command.prompt }
   }
   const handle = await resumeAgent(
     agents,
     { resumeSessionId: SessionId(active.command.resume_session_id), agentOptions: options, setup },
     active.command.cwd,
   )
-  return { handle, resumed: true }
+  return { handle, resumed: true, prompt: active.command.prompt }
 }
 
 export function rejectPendingInbox(active: ActiveRun): void {
@@ -771,7 +777,7 @@ async function execute(ctx: Context, active: ActiveRun): Promise<number> {
     let outcome: 'settled' | 'cancelled' = active.cancelRequested ? 'cancelled' : 'settled'
     if (!active.cancelRequested) {
       handle.agent.followup(createUserMessage({
-        content: [{ type: 'text', text: active.command.prompt }],
+        content: [{ type: 'text', text: created.prompt }],
         source: { kind: 'user' },
       }))
       outcome = await waitForQuiescence(subagentLifecycle(ctx), handle.agent, active.cancel.signal)
