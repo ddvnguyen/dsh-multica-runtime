@@ -106,6 +106,7 @@
     "@deepseek-ai/dsh-user-questions": "0.2.1-rc.2",
     "@types/node": "^22.20.0",
     "commander": "^15.0.0",
+    "dsh-v4-format": "npm:@deepseek-ai/dsh-session-format-v3-to-v4@0.2.2-alpha.3",
     "typescript": "6.0.3",
     "vitest": "4.1.8"
   },
