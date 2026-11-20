@@ -18,8 +18,10 @@ a versioned JSONL protocol over stdio and composes over
 ## Local development
 
 The DSH packages used by this plugin are public npm packages. This checkout is
-currently validated against `@deepseek-ai/dsh@0.2.1-rc.2` and its matching
-`@deepseek-ai/dsh-*` package family. `engines.dsh` declares the supported range
+currently validated against `@deepseek-ai/dsh@0.2.1-rc.2` and `0.2.2-rc.3` and
+their matching `@deepseek-ai/dsh-*` package families; 0.2.2 renamed the subagent
+wait to `waitForTreeWork`, and the bridge calls whichever name the loaded
+service exposes. `engines.dsh` declares the supported range
 (`>=0.2.1-rc.2 <0.3.0`); DSH refuses to load the bundle outside it. DSH 0.1.x
 needs the previous `0.1.0-private.1` build.
 

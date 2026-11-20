@@ -23,7 +23,7 @@ function view(agent: FakeAgent): QuiescentAgent {
   return agent as unknown as QuiescentAgent
 }
 
-function lifecycle(waitForChildren: SubagentLifecycle['waitForChildren']): SubagentLifecycle {
+function lifecycle(waitForChildren: NonNullable<SubagentLifecycle['waitForChildren']>): SubagentLifecycle {
   return { waitForChildren, drainDescendants: vi.fn(() => Promise.resolve()) }
 }
 
@@ -66,6 +66,79 @@ describe('waitForQuiescence', () => {
     await waitForQuiescence(subagents, view(agent), new AbortController().signal)
 
     expect(agent.whenIdle).toHaveBeenCalledTimes(2)
+  })
+
+  it('joins subagent tree work through the 0.2.2 waitForTreeWork name', async () => {
+    const agent = fakeAgent()
+    // Two children settle in turn; each wakes the parent, which appends events.
+    let pending = 2
+    const treeWork = vi.fn<() => Promise<boolean>>(() => {
+      if (pending === 0) return Promise.resolve(false)
+      pending -= 1
+      agent.session.seq += 1
+      return Promise.resolve(true)
+    })
+    const subagents: SubagentLifecycle = {
+      waitForTreeWork: treeWork,
+      drainDescendants: vi.fn(() => Promise.resolve()),
+    }
+
+    await expect(waitForQuiescence(subagents, view(agent), new AbortController().signal)).resolves.toBe('settled')
+
+    expect(treeWork).toHaveBeenCalledTimes(3)
+    expect(agent.whenIdle).toHaveBeenCalledTimes(3)
+  })
+
+  it('does not report settled while an asynchronous tree wait is still running', async () => {
+    const agent = fakeAgent()
+    let markEntered!: () => void
+    const entered = new Promise<void>((resolveEntered) => { markEntered = resolveEntered })
+    let finishChild!: (value: boolean) => void
+    const childWait = new Promise<boolean>((resolveChild) => { finishChild = resolveChild })
+    let calls = 0
+    const treeWork = vi.fn<() => Promise<boolean>>(() => {
+      calls += 1
+      if (calls > 1) return Promise.resolve(false)
+      markEntered()
+      return childWait
+    })
+    const subagents: SubagentLifecycle = {
+      waitForTreeWork: treeWork,
+      drainDescendants: vi.fn(() => Promise.resolve()),
+    }
+    let settled = false
+    const run = waitForQuiescence(subagents, view(agent), new AbortController().signal).then((value) => {
+      settled = true
+      return value
+    })
+
+    await entered
+    expect(settled).toBe(false)
+    finishChild(true)
+
+    await expect(run).resolves.toBe('settled')
+    expect(treeWork).toHaveBeenCalledTimes(2)
+    expect(agent.whenIdle).toHaveBeenCalledTimes(2)
+  })
+
+  it('propagates an asynchronous tree-wait failure instead of reporting settled', async () => {
+    const agent = fakeAgent()
+    const failure = new Error('tree wait failed')
+    const subagents: SubagentLifecycle = {
+      waitForTreeWork: vi.fn(() => Promise.reject(failure)),
+      drainDescendants: vi.fn(() => Promise.resolve()),
+    }
+
+    await expect(waitForQuiescence(subagents, view(agent), new AbortController().signal)).rejects.toBe(failure)
+  })
+
+  it('settles after one idle check when the mounted service exposes neither child wait', async () => {
+    const agent = fakeAgent()
+    const subagents: SubagentLifecycle = { drainDescendants: vi.fn(() => Promise.resolve()) }
+
+    await expect(waitForQuiescence(subagents, view(agent), new AbortController().signal)).resolves.toBe('settled')
+
+    expect(agent.whenIdle).toHaveBeenCalledTimes(1)
   })
 
   it('stops waiting on children once the task is cancelled', async () => {
