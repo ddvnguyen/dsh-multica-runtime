@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
   settleCancelled,
+  SubagentContractError,
   waitForQuiescence,
   type CancellableAgent,
   type QuiescentAgent,
@@ -132,11 +133,22 @@ describe('waitForQuiescence', () => {
     await expect(waitForQuiescence(subagents, view(agent), new AbortController().signal)).rejects.toBe(failure)
   })
 
-  it('settles after one idle check when the mounted service exposes neither child wait', async () => {
+  it('fails clearly when a mounted service exposes neither child wait', async () => {
     const agent = fakeAgent()
     const subagents: SubagentLifecycle = { drainDescendants: vi.fn(() => Promise.resolve()) }
 
-    await expect(waitForQuiescence(subagents, view(agent), new AbortController().signal)).resolves.toBe('settled')
+    // Settling here would emit the result while descendants may still run, so
+    // an unknown mounted interface must reject instead of losing that work.
+    await expect(waitForQuiescence(subagents, view(agent), new AbortController().signal))
+      .rejects.toBeInstanceOf(SubagentContractError)
+    await expect(waitForQuiescence(subagents, view(agent), new AbortController().signal))
+      .rejects.toThrow(/neither waitForTreeWork .* nor waitForChildren/)
+  })
+
+  it('settles after one idle check when the profile mounts no subagents service', async () => {
+    const agent = fakeAgent()
+
+    await expect(waitForQuiescence(undefined, view(agent), new AbortController().signal)).resolves.toBe('settled')
 
     expect(agent.whenIdle).toHaveBeenCalledTimes(1)
   })

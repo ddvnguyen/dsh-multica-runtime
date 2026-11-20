@@ -21,21 +21,34 @@ export interface SubagentLifecycle {
  * `waitForTreeWork(root)` and kept the contract: both return true when work was
  * joined so the host rechecks root completion. The name is the only difference,
  * so a pinned name turns the other version into a `TypeError` at this call and
- * fails every run at finalization instead of starting. A service exposing
- * neither name (a later release inside the `<0.3.0` range) is treated as
- * tracking no observable child work rather than crashing the run.
+ * fails every run at finalization instead of starting.
+ *
+ * A profile that mounts no service tracks no child work, so `undefined` is a
+ * definite answer. A mounted service exposing neither name is not: settling
+ * then would emit the result while descendants still run, silently losing
+ * their output, so the wait fails with the contract error instead. That names
+ * the release drift for the next reader instead of repeating this bug.
  * @param subagents - DSH's subagent service, absent when the profile mounts none.
  * @param agent - the task's root agent.
  * @returns whether subagent work was joined.
+ * @throws {SubagentContractError} when a mounted service has neither known wait.
  */
 function joinSubagentWork(subagents: SubagentLifecycle | undefined, agent: Agent): Promise<boolean> {
-  if (subagents !== undefined && typeof subagents.waitForTreeWork === 'function') {
-    return subagents.waitForTreeWork(agent)
+  if (subagents === undefined) return Promise.resolve(false)
+  if (typeof subagents.waitForTreeWork === 'function') return subagents.waitForTreeWork(agent)
+  if (typeof subagents.waitForChildren === 'function') return subagents.waitForChildren(agent)
+  throw new SubagentContractError(
+    'DSH subagents service exposes neither waitForTreeWork (0.2.2+) nor waitForChildren (0.2.1); '
+    + 'refusing to report the run settled while descendants may still be running',
+  )
+}
+
+/** A mounted subagents service does not implement either wait this bridge drives. */
+export class SubagentContractError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'SubagentContractError'
   }
-  if (subagents !== undefined && typeof subagents.waitForChildren === 'function') {
-    return subagents.waitForChildren(agent)
-  }
-  return Promise.resolve(false)
 }
 
 /** The agent surface the quiescence loop reads. */
